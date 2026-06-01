@@ -1,10 +1,12 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/atotto/clipboard"
@@ -14,24 +16,48 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/FallseF/Kioku/internal/model"
+	"github.com/FallseF/Kioku/internal/titler"
 )
 
-const chordTimeout = 1500 * time.Millisecond
+const (
+	chordTimeout = 1500 * time.Millisecond
+
+	// headlineLimit is the rune length above which the user's first message is
+	// considered too long to be a clean headline; such sessions fall through to
+	// aiTitle or a locally generated title.
+	headlineLimit = 64
+)
 
 type sessionItem struct {
 	s model.Session
 }
 
 func (i sessionItem) FilterValue() string {
-	return i.s.Title + " " + i.s.FirstMessage + " " + i.s.CWD
+	return strings.Join([]string{i.s.FirstMessage, i.s.GenTitle, i.s.Title, i.s.CWD}, " ")
 }
 
+// Title is the headline shown for a session, resolved in priority order:
+//  1. the user's own first message, when short enough to read at a glance;
+//  2. a locally generated Japanese title (ollama), if present;
+//  3. Claude Code's own aiTitle;
+//  4. the long first message, truncated;
+//  5. a placeholder.
+//
+// Generation (step 2) only ever runs for sessions that would otherwise land on
+// step 4, so a short first message or an existing aiTitle always wins.
 func (i sessionItem) Title() string {
-	if i.s.FirstMessage != "" {
-		return i.s.FirstMessage
+	fm := strings.TrimSpace(i.s.FirstMessage)
+	if fm != "" && runeLen(fm) <= headlineLimit {
+		return fm
+	}
+	if i.s.GenTitle != "" {
+		return i.s.GenTitle
 	}
 	if i.s.Title != "" {
 		return i.s.Title
+	}
+	if fm != "" {
+		return truncateRunes(fm, headlineLimit)
 	}
 	return "(無題)"
 }
@@ -42,13 +68,36 @@ func (i sessionItem) Description() string {
 	return fmt.Sprintf("%s  ·  %s  ·  %d件", cwd, age, i.s.MessageCount)
 }
 
+// NeedsTitleGen reports whether a session has no good headline yet and would
+// benefit from a locally generated title.
+func NeedsTitleGen(s model.Session) bool {
+	if s.GenTitle != "" {
+		return false
+	}
+	if fm := strings.TrimSpace(s.FirstMessage); fm != "" && runeLen(fm) <= headlineLimit {
+		return false
+	}
+	if s.Title != "" {
+		return false
+	}
+	return strings.TrimSpace(s.GenContext) != ""
+}
+
 type Model struct {
 	list        list.Model
+	sessions    []model.Session
+	idIndex     map[string]int // sessionID -> index into sessions/items (stable, insertion order)
 	selected    *model.Session
 	width       int
 	height      int
 	copyChordAt time.Time // when the first 'c' of a "cc" chord was pressed; zero = not pending
 	syncChordAt time.Time // when the first 'g' of a "gg" chord was pressed; zero = not pending
+
+	gen      *titler.Generator
+	cache    *titler.Cache
+	titleCh  chan titleResult
+	stop     chan struct{}
+	stopOnce *sync.Once
 }
 
 // syncDoneMsg is the result of an asynchronous sync.Export call.
@@ -57,10 +106,24 @@ type syncDoneMsg struct {
 	err error
 }
 
-func NewModel(sessions []model.Session) Model {
+// titleResult carries one freshly generated title back to the Update loop.
+type titleResult struct {
+	id    string
+	title string
+}
+
+// titlesDoneMsg signals the background generator has finished or been stopped.
+type titlesDoneMsg struct{}
+
+// NewModel builds the TUI. gen may be nil (ollama unavailable / disabled), in
+// which case no titles are generated and cached/aiTitle headlines are used as
+// is. cache is always provided so generated titles persist across runs.
+func NewModel(sessions []model.Session, gen *titler.Generator, cache *titler.Cache) Model {
 	items := make([]list.Item, len(sessions))
+	idIndex := make(map[string]int, len(sessions))
 	for i, s := range sessions {
 		items[i] = sessionItem{s: s}
+		idIndex[s.ID] = i
 	}
 
 	delegate := list.NewDefaultDelegate()
@@ -72,7 +135,7 @@ func NewModel(sessions []model.Session) Model {
 		BorderLeftForeground(lipgloss.Color("212"))
 
 	l := list.New(items, delegate, 0, 0)
-	l.Title = "ClaudeHistory"
+	l.Title = "Kioku"
 	l.Styles.Title = lipgloss.NewStyle().
 		Background(lipgloss.Color("57")).
 		Foreground(lipgloss.Color("230")).
@@ -107,16 +170,102 @@ func NewModel(sessions []model.Session) Model {
 	km.ForceQuit.SetHelp("ctrl+c", "強制終了")
 	l.KeyMap = km
 
-	return Model{list: l}
+	m := Model{
+		list:     l,
+		sessions: sessions,
+		idIndex:  idIndex,
+		gen:      gen,
+		cache:    cache,
+		stopOnce: &sync.Once{},
+	}
+	if gen != nil {
+		m.titleCh = make(chan titleResult)
+		m.stop = make(chan struct{})
+	}
+	return m
 }
 
-func (m Model) Init() tea.Cmd { return nil }
+func (m Model) Init() tea.Cmd {
+	if m.gen == nil {
+		return nil
+	}
+	var todo []model.Session
+	for _, s := range m.sessions {
+		if NeedsTitleGen(s) {
+			todo = append(todo, s)
+		}
+	}
+	if len(todo) == 0 {
+		return nil
+	}
+	go m.runGenerator(todo)
+	return waitForTitle(m.titleCh)
+}
+
+// runGenerator generates titles for todo (newest-first) on a background
+// goroutine, persisting each to the cache and streaming it to the Update loop.
+// It exits promptly when stop is closed (e.g. the user picked a session).
+func (m Model) runGenerator(todo []model.Session) {
+	defer close(m.titleCh)
+
+	// Tie the generation context to stop so closing it (Shutdown) aborts any
+	// in-flight ollama request instead of blocking up to the client timeout.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-m.stop:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	for _, s := range todo {
+		select {
+		case <-m.stop:
+			return
+		default:
+		}
+		title, err := m.gen.Generate(ctx, s.GenContext)
+		if err != nil || title == "" {
+			continue
+		}
+		m.cache.Set(s.ID, title, s.Size, s.FileModTime.UnixNano())
+		_ = m.cache.Save() // cheap atomic write; keeps the cache crash-safe
+		select {
+		case m.titleCh <- titleResult{id: s.ID, title: title}:
+		case <-m.stop:
+			return
+		}
+	}
+}
+
+func waitForTitle(ch chan titleResult) tea.Cmd {
+	return func() tea.Msg {
+		r, ok := <-ch
+		if !ok {
+			return titlesDoneMsg{}
+		}
+		return r
+	}
+}
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.list.SetSize(msg.Width, msg.Height)
+		return m, nil
+
+	case titleResult:
+		if idx, ok := m.idIndex[msg.id]; ok {
+			m.sessions[idx].GenTitle = msg.title
+			cmd := m.list.SetItem(idx, sessionItem{s: m.sessions[idx]})
+			return m, tea.Batch(cmd, waitForTitle(m.titleCh))
+		}
+		return m, waitForTitle(m.titleCh)
+
+	case titlesDoneMsg:
 		return m, nil
 
 	case tea.KeyMsg:
@@ -174,6 +323,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) View() string {
 	return japanize(m.list.View())
+}
+
+// Shutdown stops the background title generator and flushes the cache. Safe to
+// call multiple times and when generation was never started.
+func (m Model) Shutdown() {
+	if m.stop != nil && m.stopOnce != nil {
+		m.stopOnce.Do(func() { close(m.stop) })
+	}
+	if m.cache != nil {
+		_ = m.cache.Save()
+	}
 }
 
 // japanize patches English strings that bubbles/list hardcodes and doesn't
@@ -235,7 +395,7 @@ func (m Model) copySelectedCommand() string {
 }
 
 // shellQuote single-quotes a string for safe shell use, escaping any embedded
-// single quotes with the standard '\'' trick.
+// single quotes with the standard '\” trick.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
@@ -246,6 +406,16 @@ func shortenPath(p string) string {
 		return "~" + strings.TrimPrefix(p, home)
 	}
 	return filepath.Clean(p)
+}
+
+func runeLen(s string) int { return len([]rune(s)) }
+
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 func humanizeDuration(d time.Duration) string {
