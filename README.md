@@ -57,9 +57,47 @@ back at your shell prompt.
 
 ### Flags
 
-| Flag    | Effect                                                            |
-|---------|-------------------------------------------------------------------|
-| `--all` | Include background sessions (e.g. claude-mem observer sessions). By default these are hidden because they tend to outnumber real sessions ~10:1. |
+| Flag            | Effect                                                    |
+|-----------------|-----------------------------------------------------------|
+| `--all`         | Include background sessions — claude-mem observer sessions, `agent-*` subagent transcripts, and autocomplete/suggestion sessions. Hidden by default because they outnumber real sessions ~10:1 and aren't meaningfully resumable. |
+| `--warm-titles` | Pre-generate Japanese headlines (via local ollama) for every session that lacks a good one, write them to the title cache, and exit without opening the TUI. Useful for warming the cache in one shot instead of letting the TUI fill it in the background. |
+
+## Session titles
+
+Kioku resolves each row's headline in priority order:
+
+1. **Your own first message**, when it's short enough to read at a glance.
+2. A **locally generated Japanese title**, for sessions whose first message is
+   long *and* have no aiTitle (see below).
+3. Claude Code's own **`aiTitle`** (its auto-generated summary).
+4. The long first message, truncated.
+5. `(無題)` for empty/throwaway sessions.
+
+The first message is cleaned of harness noise first: `<command-*>` wrappers
+(content commands like `/rinko foo` are kept as `/rinko foo`; control commands
+like `/clear`, `/effort` are skipped), `<local-command-caveat>` blocks,
+`<system-reminder>`, compaction prompts, and `claude-mem`'s "Hello memory
+agent" wrapper — from which the real request inside `<user_request>` is
+recovered rather than discarded.
+
+### Local title generation (optional, via ollama)
+
+For step 2, Kioku asks a **local [ollama](https://ollama.com)** model for a
+short Japanese title. This is the only network activity Kioku performs, it is
+**localhost-only** (nothing leaves your machine), and it's entirely optional —
+if ollama isn't running, Kioku just uses the other headline sources.
+
+- Generation runs in the background while you browse and the results are
+  cached to disk, so each session is titled at most once. Run
+  `kioku --warm-titles` to fill the cache up front instead.
+- Disable it completely with `KIOKU_TITLES=off`.
+
+| Env var              | Default                                                    | Purpose |
+|----------------------|------------------------------------------------------------|---------|
+| `KIOKU_OLLAMA_MODEL` | `qwen3:8b`                                                 | Model used for titles. |
+| `KIOKU_OLLAMA_URL`   | `http://localhost:11434`                                   | ollama endpoint. |
+| `KIOKU_TITLE_CACHE`  | `~/Library/Application Support/kioku/titles.json`          | Generated-title cache (invalidated when a session file changes). |
+| `KIOKU_TITLES`       | (unset)                                                    | Set to `off` to skip all title generation. |
 
 ## Optional: cross-machine sync (`gg`)
 
@@ -107,24 +145,26 @@ you resume it elsewhere.
 
 For each `.jsonl`, Kioku extracts:
 
-- A display title: the user's first real message, falling back to
-  `aiTitle` (Claude's auto-generated summary). Leading slash commands are
-  stripped (e.g. `/skill foo bar` → `foo bar`); `claude-mem`'s
-  `Hello memory agent~` greeting is skipped.
+- A display headline (see [Session titles](#session-titles) for the full
+  resolution order and cleaning rules).
 - `cwd` from any entry that recorded it (or decoded from the directory name
   as a fallback).
 - File mtime as last-activity timestamp.
 - Total entry count as a rough message count.
 
-No network I/O in the default build. No daemon. No external API calls. The
-binary just reads files and `exec`s `claude` directly using `syscall.Exec`,
-so there is no extra terminal window or AppleScript permission required.
+No daemon, no external API calls, no extra terminal window or AppleScript
+permission. The binary reads files and `exec`s `claude` directly via
+`syscall.Exec`. The **only** network activity is the optional, localhost-only
+ollama call used to generate Japanese titles (disable with `KIOKU_TITLES=off`);
+nothing is sent off the machine.
 
 The `sync` build adds outbound `git push` only when you explicitly press `gg`.
 
 ## Security notes
 
-- The default build does not touch the network or any external service.
+- The default build's only network activity is the optional title generation,
+  which talks to a **local** ollama on `localhost` and sends nothing off the
+  machine. Set `KIOKU_TITLES=off` to disable it. No other external services.
 - The `sync` build's `gg` will push session contents to a Git remote you
   configure. Use a **private** repository; sessions often contain
   proprietary code, API keys mentioned in conversation, and so on.
