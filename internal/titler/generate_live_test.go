@@ -19,7 +19,7 @@ func TestGenerateLive(t *testing.T) {
 		"去年のDC1の申請書のワードファイル、どっかにないかな？多分Googleドライブかローカルのどっちかにあると思う。探してみてくれない？",
 		"GhosttyをCmd Qで閉じる時に警告が出るようにしておいて",
 		"VRゴーグルつけながら風呂入ったらたのしそうじゃね？",
-		"Affilicode 取得ロジックと toridori ad との結合仕様を固める。schema.prisma / DDL を切る。",
+		"Stripe の webhook 受信ロジックと注文テーブルとの結合仕様を固める。schema.prisma / DDL を切る。",
 		"claudenosaisinnkinounoeffortnosaidaidannkanoyatukttedorekuraidugoino",
 	}
 	for _, s := range samples {
